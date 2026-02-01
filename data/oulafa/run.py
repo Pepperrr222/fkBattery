@@ -1,101 +1,92 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
 
-# ==========================================
-# 1. 设置路径（对应你的真实文件）
-# ==========================================
-FILE_PATH = r'C:\Users\24119\Desktop\MCM\fkBattery\data\oulafa\CS2_33_12_16_10.csv'
+# 1. 读取数据
+file_path = 'master.csv'
+df = pd.read_csv(file_path)
 
+# 2. 预处理：按 phone_test_id 去重，只留 1000 条
+df_mod = df.drop_duplicates(subset=['phone_test_id']).head(1000).copy()
 
-def run_euler_simulation():
-    # 读取 CSV
-    print("正在读取原始实验数据...")
-    df = pd.read_csv(FILE_PATH)
+# 定义 CPU 指数 gamma (CMOS 动态功耗通常与频率平方成正比)
+gamma = 2.0
 
-    # 清理列名空格
-    df.columns = df.columns.str.strip()
+# --- 步骤 A: 独立分项拟合 (求 alpha) ---
 
-    # ==========================================
-    # 2. 设定电池物理参数 (根据 CALCE 电池标准设定)
-    # ==========================================
-    Q_nominal = 1.1  # 额定容量 (Ah)
-    R0 = 0.05  # 假设内阻 (Ohm)
-    initial_soc = 1.0  # 假设从满电开始
+# 1. 拟合屏幕：fit(Brightness, Display_ENERGY_UW) -> alpha_screen
+# 注意：Display_ENERGY_UW 在你的表中是第 [70] 列
+reg_screen = LinearRegression(fit_intercept=False)
+X_screen = df_mod[['Brightness']].values
+y_screen = df_mod['Display_ENERGY_UW'].values
+reg_screen.fit(X_screen, y_screen)
+alpha_screen = reg_screen.coef_[0]
 
-    # 假设一组通用的锂电池 OCV-SOC 曲线系数 (V = c0 + c1*s + c2*s^2...)
-    # 如果你有具体拟合好的系数，可以替换这里
-    coeffs = [3.5, 0.5, -0.2, 0.1, 0.05, -0.01]
+# 2. 拟合CPU：fit(Freq^gamma, CPU_BIG_ENERGY_UW) -> alpha_cpu
+# 使用大核频率 [52] 和大核功耗 [78]
+reg_cpu = LinearRegression(fit_intercept=True)
+X_cpu = (df_mod[['CPU_BIG_FREQ_KHz']] ** gamma).values
+y_cpu = df_mod['CPU_BIG_ENERGY_UW'].values
+reg_cpu.fit(X_cpu, y_cpu)
+alpha_cpu = reg_cpu.coef_[0]
 
-    # ==========================================
-    # 3. 提取 CSV 中的数据列
-    # ==========================================
-    # 对应你 CSV 里的真实列名
-    currents = df['Current(A)'].values
-    voltages = df['Voltage(V)'].values
-    times = df['Test_Time(s)'].values
-
-    # 结果存储
-    sim_socs = [initial_soc]
-    predicted_voltages = []
-
-    print(f"开始欧拉法迭代计算，总计 {len(df)} 个数据点...")
-
-    # ==========================================
-    # 4. 欧拉迭代 (核心逻辑)
-    # ==========================================
-    soc = initial_soc
-
-    for i in range(len(df)):
-        # --- A. 计算当前预测电压 (用于验证模型) ---
-        # V_pred = OCV(soc) - I * R0
-        vocv = sum(c * (soc ** j) for j, c in enumerate(coeffs))
-        v_pred = vocv - currents[i] * R0
-        predicted_voltages.append(v_pred)
-
-        # --- B. 欧拉法更新 SOC ---
-        # 对应微分方程: dSOC/dt = -I / Q
-        # 离散化: SOC(n+1) = SOC(n) - (I * dt) / (Q * 3600)
-        if i < len(df) - 1:
-            dt = times[i + 1] - times[i]
-            # 这里的 dt 是两行数据之间的时间差
-
-            # 注意：如果电流为正表示放电，则减；如果为负表示充电，则加
-            soc = soc - (currents[i] * dt) / (Q_nominal * 3600)
-
-            # 限制 SOC 范围在 0-1 之间
-            soc = max(0.0, min(1.0, soc))
-            sim_socs.append(soc)
-
-    # ==========================================
-    # 5. 可视化产出
-    # ==========================================
-    print("计算完成，生成结果图...")
-
-    plt.figure(figsize=(12, 5))
-
-    # 左图：SOC 随时间的变化
-    plt.subplot(1, 2, 1)
-    plt.plot(times, sim_socs, 'g-', label='Estimated SOC (Euler)')
-    plt.title('SOC Recovery using Euler Method')
-    plt.xlabel('Test Time (s)')
-    plt.ylabel('SOC')
-    plt.legend()
-    plt.grid(True)
-
-    # 右图：模拟电压 vs 真实电压 (验证模型准确度)
-    plt.subplot(1, 2, 2)
-    plt.plot(times, voltages, 'k', alpha=0.4, label='Actual Voltage (CSV)')
-    plt.plot(times, predicted_voltages, 'r--', label='Predicted Voltage')
-    plt.title('Voltage Prediction Accuracy')
-    plt.xlabel('Test Time (s)')
-    plt.ylabel('Voltage (V)')
-    plt.legend()
-    plt.grid(True)
-
-    plt.tight_layout()
-    plt.show()
+# 3. 拟合网络：fit(Bytes, WLANBT_ENERGY_UW) -> alpha_net
+# 使用 WiFi 字节 [58] 和 WLAN 功耗 [73]
+reg_net = LinearRegression(fit_intercept=True)
+X_net = df_mod[['TOTAL_DATA_WIFI_BYTES']].values
+y_net = df_mod['WLANBT_ENERGY_UW'].values
+reg_net.fit(X_net, y_net)
+alpha_net = reg_net.coef_[0]
 
 
-if __name__ == "__main__":
-    run_euler_simulation()
+# --- 步骤 B: 总功率线性回归 (求向量 w^T) ---
+# 定义状态向量 x(t) = [u_screen, u_screen*Brightness, 1, freq^gamma, R, u_GPS, u_background]
+# P_total_uW 在你的表中是第 [12] 列
+
+X_total = pd.DataFrame()
+# u_screen: 亮度大于0即为1
+X_total['u_screen'] = (df_mod['Brightness'] > 0).astype(int)
+# u_screen * Brightness
+X_total['u_screen_brightness'] = X_total['u_screen'] * df_mod['Brightness']
+# 常数项 1 (对应 beta_processor + beta_network + P_base)
+X_total['ones'] = 1
+# freq^gamma
+X_total['freq_gamma'] = df_mod['CPU_BIG_FREQ_KHz'] ** gamma
+# R (网络吞吐)
+X_total['R'] = df_mod['TOTAL_DATA_WIFI_BYTES']
+# u_GPS: GPS 功耗大于0即为1
+X_total['u_GPS'] = (df_mod['GPS_ENERGY_UW'] > 0).astype(int)
+# u_background: 用系统基础设施功耗是否大于0作为判定
+X_total['u_background'] = (df_mod['INFRASTRUCTURE_ENERGY_UW'] > 0).astype(int)
+
+y_total = df_mod['P_total_uW']
+
+# 直接调用 sklearn 拟合向量 w^T
+model_all = LinearRegression(fit_intercept=False)
+model_all.fit(X_total, y_total)
+w_T = model_all.coef_
+
+# --- 4. 打印辨识结果 ---
+print("="*60)
+print("第一部分：分项拟合 Alpha 值 (单位: uW/unit)")
+print("-"*60)
+print(f"alpha_screen:    {alpha_screen:.6f}")
+print(f"alpha_cpu:       {alpha_cpu:.6e}") # 频率数值大，系数可能很小
+print(f"alpha_net:       {alpha_net:.6f}")
+
+print("\n第二部分：总功率模型向量 w^T 辨识结果")
+print("-"*60)
+labels = [
+    "w[0] (beta_screen)",
+    "w[1] (alpha_screen*Area)",
+    "w[2] (Combined Base Bias)",
+    "w[3] (alpha_processor)",
+    "w[4] (alpha_network)",
+    "w[5] (alpha_GPS)",
+    "w[6] (alpha_background)"
+]
+for label, val in zip(labels, w_T):
+    print(f"{label.ljust(30)}: {val:.6f}")
+
+print("="*60)
+print(f"模型整体拟合优度 R^2: {model_all.score(X_total, y_total):.4f}")
